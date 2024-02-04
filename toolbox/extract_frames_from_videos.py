@@ -5,11 +5,11 @@ import multiprocessing
 from joblib import Parallel, delayed
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--dataset_path', type=str, default='/mnt/sitzikbs_storage/Datasets/ANU_ikea_dataset_processed',
+parser.add_argument('--dataset_path', type=str, default='/media/louis/secondSSD/IKEA_ASM_DATASET/data/ikea_asm_dataset_RGB_top/ANU_ikea_dataset_video',
                     help='path to the ANU IKEA assembly video dataset')
-parser.add_argument('--output_path', type=str, default='/mnt/sitzikbs_storage/Datasets/ANU_ikea_dataset_processed_frames',
+parser.add_argument('--output_path', type=str, default='/media/louis/LaCie/louis/ikea_asm_dataset_RGB_top_frames',
                     help='path to output location of the frames extracted from the video dataset')
-parser.add_argument('--devices', nargs='+',  default=['dev1', 'dev2', 'dev3'],
+parser.add_argument('--devices', nargs='+',  default='[dev3]',
                     help='dev1 | dev2 | dev3 list of device to export')
 args = parser.parse_args()
 

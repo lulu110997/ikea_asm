@@ -32,29 +32,7 @@ import sys
 import mediapipe as mp
 import sqlite3
 
-POSE_COCO_ALT = {
-    {0, "Neck"},
-    {1, "Nose"},
-    {2, "BodyCenter"},
-    {3, "lShoulder"},
-    {4, "lElbow"},
-    {5, "lWrist"},
-    {6, "lHip"},
-    {7, "lKnee"},
-    {8, "lAnkle"},
-    {9, "rShoulder"},
-    {10, "rElbow"},
-    {11, "rWrist"},
-    {12, "rHip"},
-    {13, "rKnee"},
-    {14, "rAnkle"},
-    {15, "rEye"},
-    {16, "lEye"},
-    {17, "rEar"},
-    {18, "lEar"}
-}
-
-POSE_COCO_BODY_PARTS = {
+POSE_COCO_BODY_PARTS = [
     {0, "Nose"},
     {1, "Neck"},
     {2, "RShoulder"},
@@ -63,18 +41,19 @@ POSE_COCO_BODY_PARTS = {
     {5, "LShoulder"},
     {6, "LElbow"},
     {7, "LWrist"},
-    {8, "RHip"},
+    {8, "Bkg"},
     {9, "RKnee"},
     {10, "RAnkle"},
     {11, "LHip"},
     {12, "LKnee"},
     {13, "LAnkle"},
-    {14, "REye"},
+    {14, ""},
     {15, "LEye"},
     {16, "REar"},
     {17, "LEar"},
-    {18, "Bkg"},
-}
+    {18, "REye"},
+]
+
 class DataBase:
     def __init__(self, db_path=None, indexing_files_path=None, set='train'):
         dataset_path = '/media/louis/STORAGE/IKEA_ASM_DATASET/data/ikea_asm_dataset_RGB_top_frames'
@@ -86,11 +65,11 @@ class DataBase:
         test_filename = 'test_cross_env.txt'
         frames_per_clip = 64
         frame_skip = 1
-        self.dataset_path = dataset_path
+        indexing_files_path = default_idx_files_path if indexing_files_path is None else indexing_files_path
 
         self.db_path = default_db_path if db_path is None else db_path  # Root dir that includes
+        self.dataset_path = dataset_path
         self.set = set
-        indexing_files_path = default_idx_files_path if indexing_files_path is None else indexing_files_path
         self.db = sqlite3.connect(self.db_path)
         self.db.row_factory = sqlite3.Row
         self.cursor_vid = self.db.cursor()
@@ -128,9 +107,8 @@ class DataBase:
 
         self.video_set = self.get_video_frame_labels()  # This gives you the labels of your 'set' in one-hot encoding
 
-        self.load_poses(self.video_set[0][0], [0,1,2,3])
-        # print(len(self.clip_set), len(self.clip_label_count))
-        # print(self.video_set)
+        # for i in range(0, len(self.video_set), 5):
+        #     self.load_poses(self.video_set[i][0], [1,5,10])
 
         # GT files
         # if action_segments_filename is not None:
@@ -142,22 +120,44 @@ class DataBase:
         self.cursor_annotations.close()
         self.db.close()
 
-    def load_poses(self, video_full_path, frame_ind):
+    def save_xy(self):
+        poses2save = []
+        labels2save = []
+        for vid_path, labels, n_frames in tqdm(self.video_set):
+            poses = self.load_poses(vid_path, n_frames)
+            if labels.shape[0] < poses.shape[0]:
+                rep_val = poses.shape[0] - labels.shape[1]
+                labels = np.hstack((labels, np.tile(labels[:, [-1]], rep_val)))  # Repeat the last labels
+                labels = labels.transpose()
+            poses2save.append(poses)
+            labels2save.append(labels)
+        n_samples = 0
+        for i in range(len(poses2save)):
+            poses2save[i] = poses2save[i].reshape(-1, self.frames_per_clip, 18, 3)  # n_samples, n_frames, n_keypoints, coords
+            labels2save[i] = labels2save[i].reshape(-1, self.frames_per_clip, self.num_classes)  # n_samples, n_frames, n_classes, coords
+            n_samples += poses2save[i].shape[0]
+        poses2save = np.concatenate(poses2save, axis=0)
+        labels2save = np.concatenate(labels2save, axis=0)
+        np.save(f'X_{self.set}.npy', poses2save)
+        np.save(f'y_{self.set}.npy', labels2save)
+
+    def load_poses(self, video_full_path, n_frames):
         """
         Extracts pose for a specific set of frames. The path to video must be extracted from the output of
         get_video_frame_labels as it relies on this structure to obtain the path to the openpose predictions
         Args:
             video_full_path: str | path to video obtained from output of get_video_frame_labels
-            frame_ind: tuples | iterable containing the frame number(s) that requires the label
+            n_frames: int | represents how many frames the corresponding video contains
 
-        Returns: np array with shape (coordinates, frames, joints, N_people)
+        Returns: np array with shape (frames, joints, coordinates)
 
         """
         pose_seq = []
         pose_path = video_full_path.replace('/data/ikea_asm_dataset_RGB_top_frames', '/annotations/pose_annotations')
         pose_path = pose_path.replace('/images', '/predictions/pose2d/openpose')
         a='s'
-        for i in frame_ind:
+        remaining_clips = n_frames % self.frames_per_clip
+        for i in range(n_frames):
             pose_json_filename = os.path.join(pose_path,
                                               'scan_video_' + str(i).zfill(12) + '_keypoints' + '.json')
             # data = utils.read_pose_json(pose_json_filename)
@@ -170,14 +170,28 @@ class DataBase:
                 pose = np.array(data[0]['pose_keypoints_2d'])  # x,y,confidence
 
             pose = pose.reshape(-1, 3)  # format: joints, coordinates
+            pose = np.delete(pose, 8, 0)
             pose_seq.append(pose)
+            if i+1 == n_frames and remaining_clips != 0:
+                while (len(pose_seq) % self.frames_per_clip) != 0:
+                    pose_seq.append(pose)  # Repeat the last pose until it is divisible by frames per clip
+            # frame1 = np.zeros((1080, 1920, 3), np.uint8)
+            # frame_path = os.path.join(video_full_path.replace('STORAGE/IKEA_ASM_DATASET/data/', 'LaCie/louis/'),
+            #                                  str(i).zfill(6) + '.jpg')
+            # frame1 = cv2.imread(frame_path)
+            # for i, point in enumerate(pose):
+            #     cv2.circle(frame1, (int(point[0]), int(point[1])), 1, (0, 0, 255))
+            #     cv2.putText(frame1, str(i), (int(point[0]), int(point[1])), cv2.FONT_HERSHEY_TRIPLEX, 0.5, (0, 0, 255), 1)
+            # cv2.imshow('fra', frame1)
+            # cv2.waitKey()
+            # cv2.destroyAllWindows()
 
         # pose_seq = torch.tensor(pose_seq, dtype=torch.float32)
         # pose_seq = pose_seq[:, :, 0:2].unsqueeze(-1)  # format: frames, joints, coordinates, N_people
         # pose_seq = pose_seq.permute(2, 0, 1, 3)  # format: coordinates, frames, joints, N_people
-        pose_seq = np.array(pose_seq, dtype=np.float32)
-        pose_seq = np.expand_dims(pose_seq[:, :, 0:2], -1)  # format: frames, joints, coordinates, N_people
-        # pose_seq = np.transpose(pose_seq, (0, 1, 3))  # format: coordinates, frames, joints, N_people
+        pose_seq = np.array(pose_seq, dtype=np.float32)  # format: frames, joints, coordinates
+
+        assert pose_seq.shape[0] >= n_frames and (pose_seq.shape[0] % self.frames_per_clip) == 0
 
         return pose_seq
 
@@ -345,8 +359,8 @@ class DataBase:
                 continue
             if n_frames < 66 * self.frame_skip:  # check video length
                 continue
-            if not os.path.exists(video_full_path):  # check if frame folder exists
-                continue
+            # if not os.path.exists(video_full_path):  # check if frame folder exists
+            #     continue
 
             label = np.zeros((self.num_classes, n_frames), np.float32) # TODO: dont allow multi-class representation
             label[0, :] = np.ones((1, n_frames), np.float32)   # initialize all frames as background|transition
@@ -419,39 +433,10 @@ class DataBase:
             output = rows[0]["id"]
         return output
 
-# Some stuff to inspect json
-# anno = np.load("/media/louis/STORAGE/IKEA_ASM_DATASET/annotations/action_annotations/gt_action.npy",
-#                allow_pickle=True).item()
-# c=0
-# for labels, name in list(zip(anno["gt_labels"], anno["scan_name"])):
-#     if "Lack_TV_Bench/0025_black_table_04_02_2019_08_20_13_48" in name:
-#         print(len(labels))
-#     c+=1
-# print(c)
-# sys.exit()
-
 db = DataBase()
-# a = db.get_video_frame_labels()  # This will give me labels for train/test. Now I just have to convert it to the same format as mpose
-
-# TODO: Need to get all joint skeletons
-# print(a[0][0], a[0][1].shape, a[0][2])
+db.save_xy()
 sys.exit()
-# video_table = db.get_annotated_videos_table().fetchall()  # All the vids
-results_json = '/media/louis/STORAGE/IKEA_ASM_DATASET/annotations/action_annotations/gt_segments.json'
-for a in db.get_annotated_videos_table():
-    if "Lack_TV_Bench/0025_black_table_04_02_2019_08_20_13_48" in a["video_path"]:
-        video_id = a["id"]
-        annotation_table = db.get_video_annotations_table(video_id)
-        c = 0
-        # print(a["nframes"])
-        for ann_row in annotation_table:
-            print(ann_row["atomic_action_id"])
-            # sys.exit()
-            # atomic_action_id = ann_row["atomic_action_id"]  # map the labels
-            # object_id = ann_row["object_id"]
-            # action_id = db.get_action_id(atomic_action_id, object_id)
-        print(c)
-        sys.exit()
+
 sys.exit()
     # db.get_video_annotations_table(vid_id)
 # labels = db.get_actions_labels_from_json(results_json, mode='gt')
@@ -466,100 +451,3 @@ sys.exit()
 #     for ann_row in video_annotation_table:
 #         action_id = db.get_action_id(ann_row['atomic_action_id'], ann_row['object_id'])
 #         print(action_id)
-sys.exit()
-#Flags for postprocessing exports
-parser = argparse.ArgumentParser()
-parser.add_argument('--input_path', type=str,
-                    default='/media/louis/STORAGE/IKEA_ASM_DATASET/annotations/pose_annotations',
-                    help='path to the ANU IKEA dataset')
-parser.add_argument('--output_path', type=str,
-                    default='/media/louis/STORAGE/IKEA_ASM_DATASET/annotations/pose_annotations_npy',
-                    help='path to the ANU IKEA dataset')
-FLAGS = parser.parse_args()
-
-INPUT_PATH = FLAGS.input_path
-OUTPUT_PATH = FLAGS.output_path
-
-if not os.path.exists(OUTPUT_PATH):
-    os.makedirs(OUTPUT_PATH)
-
-PATH_TO_MODEL = '/home/louis/Data/Fernandez_HAR/hand_landmarker.task'
-MILLI = 1000
-
-# file_list = utils.get_list_of_all_files(INPUT_PATH, file_type='.jpg')
-
-
-a = "asd"
-
-sys.exit()
-
-def save_hand_skeleton(filename):
-    """
-    Obtain the hand skeleton and save to output directory
-    Args:
-        filename: string | path to image
-    """
-    with HandLandmarker.create_from_options(options) as landmarker:
-        cv_image = cv2.cvtColor(cv2.imread(filename), cv2.COLOR_BGR2RGB)[200:-300, 400:-300]
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=np.array(cv_image))
-        cv2.imshow('win', cv_image)
-        cv2.waitKey(-1)
-        cv2.destroyAllWindows()
-        # print(filename); sys.exit()
-
-        # Perform hand landmarks detection on the provided single image.
-        # The hand landmarker must be created with the image mode.
-        hand_landmarker_result = landmarker.detect(mp_image)
-        print(hand_landmarker_result); sys.exit()
-
-    output_filename = filename.replace(INPUT_PATH, OUTPUT_PATH)
-    output_dir_path = os.path.dirname(os.path.abspath(output_filename))
-    if not os.path.exists(output_filename):
-        os.makedirs(output_dir_path, exist_ok=True)
-
-    # Save result
-    json_file = convert2json(hand_landmarker_result)
-
-
-def convert2json(result):
-    """
-    Convert hand landmarker result from mediapipe to have similar structure as openpose json file
-    Args:
-        result: mediapipe's hand landmarker result | output of fn for detecting the hand skeleton
-    """
-    # z (depth) can be extracted from the depth images
-    # Need the form xn, yn, cn. Use only the un-normalised projected values
-    print(result.handedness)
-    # sys.exit()
-    json_data = {
-        "version": 1.3,
-        "people": [
-            {
-                "person_id": [-1],
-                "hand_left_keypoints_2d": [],
-                "hand_right_keypoints_2d": []
-            }
-        ]
-    }
-
-    return json_data
-
-
-# for i in file_list[600:]:
-#     save_hand_skeleton(i)
-
-mpose_sample = np.load('/home/louis/.mpose/openpose/1/X_test.npy')
-# print(mpose_sample[0].shape, mpose_sample[0,0,:,:])
-seq_list =[]
-for seq in mpose_sample:
-    v1 = np.zeros((30 + 1, seq.shape[1], 3 - 1))
-    v2 = np.zeros((30 + 1, seq.shape[1], 3 - 1))
-    v1[1:, ...] = seq[:, :, :2]
-    v2[:30, ...] = seq[:, :, :2]
-    vel = (v2 - v1)[:-1, ...]
-    data = np.concatenate((seq[:, :, :2], vel), axis=-1)
-    data = np.concatenate((data, seq[:, :, -1:]), axis=-1)
-    seq_list.append(data)
-X_train = np.stack(seq_list)
-s='asd'
-

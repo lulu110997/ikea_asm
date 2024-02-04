@@ -19,7 +19,10 @@
 # https://arxiv.org/pdf/2007.00394.pdf
 '''
 import json
+import typing
+from typing import Tuple, Union, Any
 
+from numpy import ndarray, _DType_co, dtype, _ShapeType, void
 from tqdm import tqdm
 import argparse
 import tb_utils as utils
@@ -49,6 +52,7 @@ if not os.path.exists(OUTPUT_PATH):
 
 PATH_TO_MODEL = '/home/louis/Data/Fernandez_HAR/hand_landmarker.task'
 MILLI = 1000
+OFFSET = (10, 10)
 
 BaseOptions = mp.tasks.BaseOptions
 HandLandmarker = mp.tasks.vision.HandLandmarker
@@ -63,6 +67,38 @@ options = HandLandmarkerOptions(
     min_hand_presence_confidence=0.1,
     min_tracking_confidence=0.1)
 
+
+def crop_img(img: np.ndarray, pose: np.ndarray) -> Tuple[...]:
+    """
+    Args:
+        img (np.ndarray): represents
+        pose (np.ndarray):
+
+    Returns: Tuple[...] : me
+    """
+
+    x_min = 100000
+    x_max = 0
+    y_min = 100000
+    y_max = 0
+
+    for i in pose:
+        if i[0, 0] < x_min:
+            x_min = i[0, 0]
+        if i[0, 1] < y_min:
+            y_min = i[0, 1]
+
+        if i[0, 0] > x_max:
+            x_max = i[0, 0]
+        if i[0, 1] > y_max:
+            y_max = i[0, 1]
+
+    img_offsets = (y_min-OFFSET[0], y_max+OFFSET[0], x_min-OFFSET[1], x_max+OFFSET[1])
+    img = img[y_min-OFFSET[0]:y_max+OFFSET[0], x_min-OFFSET[1]:x_max+OFFSET[1]]
+
+    return (img_offsets, img)  # noqa
+
+
 def save_hand_skeleton(filename):
     """
     Obtain the hand skeleton and save to output directory
@@ -70,8 +106,9 @@ def save_hand_skeleton(filename):
         filename: string | path to image
     """
     with HandLandmarker.create_from_options(options) as landmarker:
-        cv_image = cv2.cvtColor(cv2.imread(filename), cv2.COLOR_BGR2RGB)[200:-300, 400:-300]
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=np.array(cv_image))
+        pose = ...
+        cv_image = cv2.cvtColor(cv2.imread(filename), cv2.COLOR_BGR2RGB)
+        cv_image = crop_img(cv_image, pose)
         cv2.imshow('win', cv_image)
         cv2.waitKey(-1)
         cv2.destroyAllWindows()
@@ -79,6 +116,7 @@ def save_hand_skeleton(filename):
 
         # Perform hand landmarks detection on the provided single image.
         # The hand landmarker must be created with the image mode.
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=np.array(cv_image))
         hand_landmarker_result = landmarker.detect(mp_image)
         print(hand_landmarker_result); sys.exit()
 
