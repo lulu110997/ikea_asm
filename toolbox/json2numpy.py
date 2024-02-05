@@ -1,58 +1,16 @@
-'''
-# The landmarker is initialized. Use it here.
-# Load the frame rate of the video using OpenCV’s CV_CAP_PROP_FPS
-# The three Kinect V2 cameras are triggered to capture the assembly activities  simultaneously in real
-# time (∼24 fps)
-# There are in total 1113 RGB videos and 371 depth videos (top view). Overall, the dataset contains 3,046,977
-# frames (∼35.27h) of footage with an average of 2735.2 frames per video (∼1.89min).
-# The dataset contains a total of 16,764 annotated actions with an average of 150 frames per action (∼6sec)
-# TODO: For a full list of action names and ids, see supplemental
-# Temporally, we specify the boundaries (start and end frame) of all atomic actions in the video from a pre-defined set.
-# TODO: atomic actions?
-# We also annotated the human skeleton of the subjects involved assembly... Annotated 12 body joints... Due to
-# occlusion with furniture, self-occlusions and uncommon  human poses, we include a confidence value between 1
-# and 3 along with the annotation
-# The dataset contains 2D human joint annotations in the COCO format [39] for 1% of frames, the same keyframes
-# selected for instance segmentation, which cover a diverse range of human poses across each video.
-# We also obtain pseudo-ground-truth 3D annotations by fine-tuning a Mask R-CNN [22] 2D joint detector on the
-# labeled data, and triangulating the detections of the model from the three calibrated camera views
-# https://arxiv.org/pdf/2007.00394.pdf
-'''
-import json
-
+"""
+TODO: Figure out multiclass labelling
+TODO: Figure out why label is sometimes None
+TODO: Validate the exported npy data
+"""
+from joblib import Parallel, delayed
 from tqdm import tqdm
-import argparse
-import tb_utils as utils
+import json
 import os
-from PIL import Image
-from multiprocessing import Pool
+import multiprocessing
 import cv2
 import numpy as np
-import sys
-import mediapipe as mp
 import sqlite3
-
-POSE_COCO_BODY_PARTS = [
-    {0, "Nose"},
-    {1, "Neck"},
-    {2, "RShoulder"},
-    {3, "RElbow"},
-    {4, "RWrist"},
-    {5, "LShoulder"},
-    {6, "LElbow"},
-    {7, "LWrist"},
-    {8, "Bkg"},
-    {9, "RKnee"},
-    {10, "RAnkle"},
-    {11, "LHip"},
-    {12, "LKnee"},
-    {13, "LAnkle"},
-    {14, ""},
-    {15, "LEye"},
-    {16, "REar"},
-    {17, "LEar"},
-    {18, "REye"},
-]
 
 class DataBase:
     def __init__(self, db_path=None, indexing_files_path=None, set='train'):
@@ -98,22 +56,13 @@ class DataBase:
         self.testset_video_list = self.get_list_from_file(self.test_filename)
         self.all_video_list = self.testset_video_list + self.trainset_video_list
 
-        #### ADD STUFF BELOW IF ITS FROM A CHILD CLASS
-
         if self.set == 'train':
             self.video_list = self.trainset_video_list
         elif self.set == 'test':
             self.video_list = self.testset_video_list
 
-        self.video_set = self.get_video_frame_labels()  # This gives you the labels of your 'set' in one-hot encoding
+        self.video_set = self.get_video_frame_labels()
 
-        # for i in range(0, len(self.video_set), 5):
-        #     self.load_poses(self.video_set[i][0], [1,5,10])
-
-        # GT files
-        # if action_segments_filename is not None:
-        #     self.segment_json_filename = action_segments_filename
-        #     self.action_labels = self.get_actions_labels_from_json(self.segment_json_filename, mode='gt')
 
     def __exit__(self, exc_type, exc_value, traceback):
         self.cursor_vid.close()
@@ -121,48 +70,110 @@ class DataBase:
         self.db.close()
 
     def save_xy(self):
+        """
+        Save the pose sequences per frame and corresponding frame labels (as class indices). This function does not use
+        joblib (ie performs tasks sequentially/in one process/thread)
+        """
         poses2save = []
         labels2save = []
+        video_paths = []
         for vid_path, labels, n_frames in tqdm(self.video_set):
-            poses = self.load_poses(vid_path, n_frames)
+            poses = self.load_poses(vid_path, n_frames)  # Obtain the pose sequence
+            video_paths.append(video_paths)  # Save video path for validation later on
+            # Ensure that we have the same amount of frames for the labels and pose seqs. The last frame may have been
+            # duplicated to ensure the sequence of poses for this video is divisible by self.frames_per_clip
             if labels.shape[0] < poses.shape[0]:
                 rep_val = poses.shape[0] - labels.shape[1]
                 labels = np.hstack((labels, np.tile(labels[:, [-1]], rep_val)))  # Repeat the last labels
-                labels = labels.transpose()
+            labels = labels.transpose()  # format: n_frames, n_classes
+            labels = np.argmax(labels, axis=1)  # Obtain labels as class index. format: n_frames
+
             poses2save.append(poses)
             labels2save.append(labels)
-        n_samples = 0
         for i in range(len(poses2save)):
             poses2save[i] = poses2save[i].reshape(-1, self.frames_per_clip, 18, 3)  # n_samples, n_frames, n_keypoints, coords
-            labels2save[i] = labels2save[i].reshape(-1, self.frames_per_clip, self.num_classes)  # n_samples, n_frames, n_classes, coords
-            n_samples += poses2save[i].shape[0]
+            labels2save[i] = labels2save[i].reshape(-1, self.frames_per_clip)  # n_samples, n_frames
+            video_paths[i] = (video_paths[i], poses2save[-1].shape[0]*poses2save[-1].shape[1])  # Save str and n_frames
         poses2save = np.concatenate(poses2save, axis=0)
         labels2save = np.concatenate(labels2save, axis=0)
+        video_paths = np.array(video_paths)
         np.save(f'X_{self.set}.npy', poses2save)
         np.save(f'y_{self.set}.npy', labels2save)
+        np.save(f'vid_paths_{self.set}.npy', video_paths)  # For validating data integrity
+
+    def save_xy_mp(self):
+        """
+        Save the pose sequences per frame and corresponding frame labels (as class indices) using joblib to improve
+        efficiency
+        """
+        num_cores = multiprocessing.cpu_count()
+        # Multi-processing to speed up job
+        output = (Parallel(backend='threading', n_jobs=num_cores)
+                  (delayed(self._collect_xy)(idx, vid_path, labels, n_frames)
+                   for idx, (vid_path, labels, n_frames) in enumerate(self.video_set)))
+        poses2save = []
+        labels2save = []
+        video_paths = []
+        for video in output:
+            poses2save.append(video[0].reshape(-1, self.frames_per_clip, 18, 3))  # n_samples, n_frames, n_keypoints, coords
+            labels2save.append(video[1].reshape(-1, self.frames_per_clip))  # n_samples, n_frames
+            video_paths.append((video[2], poses2save[-1].shape[0]*poses2save[-1].shape[1]))  # Save str and n_frames
+
+        poses2save = np.concatenate(poses2save, axis=0)
+        labels2save = np.concatenate(labels2save, axis=0)
+        video_paths = np.array(video_paths)
+        np.save(f'X_{self.set}.npy', poses2save)
+        np.save(f'y_{self.set}.npy', labels2save)
+        np.save(f'vid_paths_{self.set}.npy', video_paths)  # For validating data integrity
+
+    def _collect_xy(self, idx, vid_path, labels, n_frames):
+        """
+        Return the pose sequence and corresponding frame labels for the given video_path
+        Args:
+            idx: int | represents the which video in the list is being processed
+            vid_path: string | path to the video/images
+            labels: np array | labels which corresponds to the frame labels given as class index
+            n_frames: int | number of frames in the video
+
+        Returns: tuple | (poses, labels, vid_path). Each row of the poses represent one frame. The no. of rows may be
+        greater than n_frames to ensure divisibility with self.clip_per_frame
+        """
+        print(f"Processing video #{idx+1}/{len(self.video_set)}")
+        poses = self.load_poses(vid_path, n_frames)  # Obtain the pose sequence
+        # Ensure that we have the same amount of frames for the labels and pose seqs. The last frame may have been
+        # duplicated to ensure the sequence of poses for this video is divisible by self.frames_per_clip
+        if labels.shape[0] < poses.shape[0]:
+            rep_val = poses.shape[0] - labels.shape[1]
+            labels = np.hstack((labels, np.tile(labels[:, [-1]], rep_val)))  # Repeat the last labels
+
+        labels = labels.transpose()  # format: n_frames, n_classes
+        labels = np.argmax(labels, axis=1)  # Obtain labels as class index
+        return poses, labels, vid_path
 
     def load_poses(self, video_full_path, n_frames):
         """
-        Extracts pose for a specific set of frames. The path to video must be extracted from the output of
-        get_video_frame_labels as it relies on this structure to obtain the path to the openpose predictions
+        Extracts pose for a specific set of frames. The returned number of sequences in the returned array may have be
+        greater than the given n_frames. This is to ensure that each clip is divisible by the self.frames_per_clip
+        The path to video must be extracted from the output of get_video_frame_labels as it relies on this structure to
+        obtain the path to the openpose predictions.
         Args:
             video_full_path: str | path to video obtained from output of get_video_frame_labels
             n_frames: int | represents how many frames the corresponding video contains
 
         Returns: np array with shape (frames, joints, coordinates)
-
         """
         pose_seq = []
         pose_path = video_full_path.replace('/data/ikea_asm_dataset_RGB_top_frames', '/annotations/pose_annotations')
         pose_path = pose_path.replace('/images', '/predictions/pose2d/openpose')
-        a='s'
         remaining_clips = n_frames % self.frames_per_clip
+
         for i in range(n_frames):
-            pose_json_filename = os.path.join(pose_path,
-                                              'scan_video_' + str(i).zfill(12) + '_keypoints' + '.json')
-            # data = utils.read_pose_json(pose_json_filename)
+            # Obtain the number path to json file (pose annotations for this corresponding video)
+            pose_json_filename = os.path.join(pose_path, 'scan_video_' + str(i).zfill(12) + '_keypoints' + '.json')
             with open(pose_json_filename) as json_file:
                 data = json.load(json_file)
+
+            # Ensure we obtain the active person's pose sequences
             data = data['people']
             if len(data) > 1:
                 pose = self.get_active_person(data, center=(960, 540), min_bbox_area=20000)
@@ -172,9 +183,13 @@ class DataBase:
             pose = pose.reshape(-1, 3)  # format: joints, coordinates
             pose = np.delete(pose, 8, 0)
             pose_seq.append(pose)
+
+            # Ensure the sequence of poses is divisible by self.frames_per_clip
             if i+1 == n_frames and remaining_clips != 0:
                 while (len(pose_seq) % self.frames_per_clip) != 0:
                     pose_seq.append(pose)  # Repeat the last pose until it is divisible by frames per clip
+
+            # Check skeleton
             # frame1 = np.zeros((1080, 1920, 3), np.uint8)
             # frame_path = os.path.join(video_full_path.replace('STORAGE/IKEA_ASM_DATASET/data/', 'LaCie/louis/'),
             #                                  str(i).zfill(6) + '.jpg')
@@ -191,6 +206,7 @@ class DataBase:
         # pose_seq = pose_seq.permute(2, 0, 1, 3)  # format: coordinates, frames, joints, N_people
         pose_seq = np.array(pose_seq, dtype=np.float32)  # format: frames, joints, coordinates
 
+        # Check divisibility of the sequence of poses
         assert pose_seq.shape[0] >= n_frames and (pose_seq.shape[0] % self.frames_per_clip) == 0
 
         return pose_seq
@@ -241,25 +257,6 @@ class DataBase:
             pose = closest_pose
         return pose
 
-    def compute_skeleton_distance_to_center(self, skeleton, center=(960, 540)):
-        """
-        Compute the average distance between a given skeleton and the cetner of the image
-        Parameters
-        ----------
-        skeleton : 2d skeleton joint poistiions
-        center : image center point
-
-        Returns
-        -------
-            distance: the average distance of all non-zero joints to the center
-        """
-        idx = np.where(skeleton.any(axis=1))[0]
-        diff = skeleton - np.tile(center, [len(skeleton[idx]), 1])
-        distances = np.sqrt(np.sum(diff ** 2, 1))
-        mean_distance = np.mean(distances)
-
-        return mean_distance
-
     def get_list_from_file(self, filename):
         """
         retrieve a list of lines from a .txt file
@@ -279,22 +276,6 @@ class DataBase:
             a_o_relation_list = [[int(y) for y in x] for x in a_o_relation_list]
         return a_o_relation_list
 
-    def get_video_name_from_id(self, video_id):
-        """
-        return video name for a given video id
-        :param video_id: id of video
-
-        :return: video_name: name of the video
-        """
-        rows = self.cursor_vid.execute('''SELECT * FROM videos WHERE id = ?''',
-                                       (video_id, )).fetchall()
-        if len(rows) > 1:
-            raise ValueError("more than one video with the desired specs - check database")
-        else:
-            # output = os.path.join(rows[0]["furniture"], rows[0]["video_name"])
-            output = rows[0]["video_path"].split('dev', 1)[0][:-1]
-        return output
-
     def get_annotated_videos_table(self):
         """
         fetch the annotated videos table from the database using dev3
@@ -312,24 +293,10 @@ class DataBase:
         """
         return self.cursor_annotations.execute('''SELECT * FROM annotations WHERE video_id = ?''', (video_idx,))
 
-    def get_video_table(self, video_idx):
-        """
-        fetch the video information row from the video table in the database
-        :param :  video_idx: index of the desired video
-        :return: video information table row from the databse
-        """
-        return self.cursor_annotations.execute('''SELECT * FROM videos WHERE id = ?''', (video_idx,))
-
-    def get_annotation_table(self):
-        """
-        :return: full annotations table (for all videos)
-        """
-        return self.cursor_annotations.execute('''SELECT * FROM annotations ''')
-
     def get_action_id(self, atomic_action_id, object_id):
         """
         find the action id of an atomic action-object pair, returns None if not in the set
-        :param action_id: int id of atomic action
+        :param atomic_action_id: int id of atomic action
         :param object_id: int id of object
         :return: int compound action id | None if not in set
         """
@@ -359,11 +326,11 @@ class DataBase:
                 continue
             if n_frames < 66 * self.frame_skip:  # check video length
                 continue
-            # if not os.path.exists(video_full_path):  # check if frame folder exists
-            #     continue
+            if not os.path.exists(video_full_path):  # check if frame folder exists
+                continue
 
-            label = np.zeros((self.num_classes, n_frames), np.float32) # TODO: dont allow multi-class representation
-            label[0, :] = np.ones((1, n_frames), np.float32)   # initialize all frames as background|transition
+            label = np.zeros((self.num_classes, n_frames), np.float32)  # TODO: dont allow multi-class representation
+            label[0, :] = np.ones((1, n_frames), np.float32)  # initialize all frames as background|transition
             video_id = row['id']
             annotation_table = self.get_video_annotations_table(video_id)
             for ann_row in annotation_table:
@@ -379,75 +346,6 @@ class DataBase:
             vid_list.append((video_full_path, label, n_frames))
         return vid_list
 
-    def get_actions_labels_from_json(self, json_filename, device='dev3', mode='gt'):
-        """
-
-         Loads a label segment .json file (ActivityNet format
-          http://activity-net.org/challenges/2020/tasks/anet_localization.html) and converts to frame labels for evaluation
-
-        Parameters
-        ----------
-        json_filename : output .json file name (full path)
-        device: camera view to use
-        Returns
-        -------
-        frame_labels: one_hot frame labels (allows multi-label)
-        """
-        labels = []
-        with open(json_filename, 'r') as json_file:
-            json_dict = json.load(json_file)
-
-        if mode == 'gt':
-            video_results = json_dict["database"]
-        else:
-            video_results = json_dict["results"]
-        for scan_path in video_results:
-            video_path = os.path.join(scan_path, device, 'images')
-            video_idx = self.get_video_id_from_video_path(video_path, device=device)
-            video_info = self.get_video_table(video_idx).fetchone()
-            n_frames = video_info["nframes"]
-            current_labels = np.zeros([n_frames, self.num_classes])
-            if mode == 'gt':
-                segments = video_results[scan_path]['annotation']
-            else:
-                segments = video_results[scan_path]
-            for segment in segments:
-                action_idx = self.action_list.index(segment["label"])
-                start = segment['segment'][0]
-                end = segment['segment'][1]
-                current_labels[start:end, action_idx] = 1
-            labels.append(current_labels)
-        return labels
-
-    def get_video_id_from_video_path(self, video_path, device='dev3'):
-        """
-        return video id for a given video path
-        :param video_path: path to video (including device and image dir)
-        :return: video_id: id of the video
-        """
-        rows = self.cursor_vid.execute('''SELECT * FROM videos WHERE video_path = ? AND camera = ?''',
-                                       (video_path, device)).fetchall()
-        if len(rows) > 1:
-            raise ValueError("more than one video with the desired specs - check database")
-        else:
-            output = rows[0]["id"]
-        return output
 
 db = DataBase()
-db.save_xy()
-sys.exit()
-
-sys.exit()
-    # db.get_video_annotations_table(vid_id)
-# labels = db.get_actions_labels_from_json(results_json, mode='gt')
-
-# for row in video_table:
-#     video_id = row['id']
-#     video_name = db.get_video_name_from_id(video_id)
-#     # This just gives the different actions that were performed in the video but
-#     # does not include timestamps of action
-#     video_annotation_table = db.get_video_annotations_table(video_id).fetchall()
-#     print(len(video_annotation_table))
-#     for ann_row in video_annotation_table:
-#         action_id = db.get_action_id(ann_row['atomic_action_id'], ann_row['object_id'])
-#         print(action_id)
+db.save_xy_mp()
