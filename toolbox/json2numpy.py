@@ -8,12 +8,13 @@ from tqdm import tqdm
 import json
 import os
 import multiprocessing
+import statistics
 import cv2
 import numpy as np
 import sqlite3
 
 class DataBase:
-    def __init__(self, db_path=None, indexing_files_path=None, set='train'):
+    def __init__(self, db_path=None, indexing_files_path=None, set='test'):
         dataset_path = '/media/louis/STORAGE/IKEA_ASM_DATASET/data/ikea_asm_dataset_RGB_top_frames'
         default_db_path = '/media/louis/STORAGE/IKEA_ASM_DATASET/annotations/action_annotations/ikea_annotation_db_full'
         default_idx_files_path = '/media/louis/STORAGE/IKEA_ASM_DATASET/indexing_files'
@@ -116,11 +117,21 @@ class DataBase:
         video_paths = []
         for video in output:
             poses2save.append(video[0].reshape(-1, self.frames_per_clip, 18, 3))  # n_samples, n_frames, n_keypoints, coords
-            labels2save.append(video[1].reshape(-1, self.frames_per_clip))  # n_samples, n_frames
+            labels = video[1].reshape(-1, self.frames_per_clip)  # n_samples, n_frames
+            for l in labels:  # The clip label is the label that occur the most
+                label = statistics.multimode(l)
+                if len(label) > 1:
+                    if 0 in label:  # Remove 'none' label
+                        label.remove(0)
+                    if 17 in label:  # Remove 'other' label
+                        label.remove(17)
+                    if len(label) != 1:  # Either empty as it (only) contains [0,7] or frame contains more than 1 label
+                        label = [0]
+                labels2save.append(label[0])
             video_paths.append((video[2], poses2save[-1].shape[0]*poses2save[-1].shape[1]))  # Save str and n_frames
 
         poses2save = np.concatenate(poses2save, axis=0)
-        labels2save = np.concatenate(labels2save, axis=0)
+        labels2save = np.array(labels2save, dtype=np.long)
         video_paths = np.array(video_paths)
         np.save(f'X_{self.set}.npy', poses2save)
         np.save(f'y_{self.set}.npy', labels2save)
