@@ -3,18 +3,18 @@ TODO: Figure out multiclass labelling
 TODO: Figure out why label is sometimes None
 TODO: Validate the exported npy data
 """
-from joblib import Parallel, delayed
+from typing import Tuple, List
 from tqdm import tqdm
+from scipy import stats
 import json
 import os
-import multiprocessing
 import statistics
-import cv2
 import numpy as np
 import sqlite3
 
+
 class DataBase:
-    def __init__(self, db_path=None, indexing_files_path=None, set='test'):
+    def __init__(self, db_path=None, indexing_files_path=None, set='train'):
         dataset_path = '/media/louis/STORAGE/IKEA_ASM_DATASET/data/ikea_asm_dataset_RGB_top_frames'
         default_db_path = '/media/louis/STORAGE/IKEA_ASM_DATASET/annotations/action_annotations/ikea_annotation_db_full'
         default_idx_files_path = '/media/louis/STORAGE/IKEA_ASM_DATASET/indexing_files'
@@ -22,7 +22,7 @@ class DataBase:
         action_object_relation_filename = 'action_object_relation_list.txt'
         train_filename = 'train_cross_env.txt'
         test_filename = 'test_cross_env.txt'
-        frames_per_clip = 64
+        frames_per_clip = 30
         frame_skip = 1
         indexing_files_path = default_idx_files_path if indexing_files_path is None else indexing_files_path
 
@@ -64,11 +64,14 @@ class DataBase:
 
         self.video_set = self.get_video_frame_labels()
 
+    def __enter__(self):
+        return self
 
     def __exit__(self, exc_type, exc_value, traceback):
         self.cursor_vid.close()
         self.cursor_annotations.close()
         self.db.close()
+        print("db connections closed")
 
     def save_xy(self):
         """
@@ -78,9 +81,9 @@ class DataBase:
         poses2save = []
         labels2save = []
         video_paths = []
+        # Iterate through the set of videos
         for vid_path, labels, n_frames in tqdm(self.video_set):
-            poses = self.load_poses(vid_path, n_frames)  # Obtain the pose sequence
-            video_paths.append(video_paths)  # Save video path for validation later on
+            poses, clips = self.load_poses(vid_path, n_frames)  # Obtain the pose sequence for this vid
             # Ensure that we have the same amount of frames for the labels and pose seqs. The last frame may have been
             # duplicated to ensure the sequence of poses for this video is divisible by self.frames_per_clip
             if labels.shape[0] < poses.shape[0]:
@@ -89,100 +92,55 @@ class DataBase:
             labels = labels.transpose()  # format: n_frames, n_classes
             labels = np.argmax(labels, axis=1)  # Obtain labels as class index. format: n_frames
 
-            poses2save.append(poses)
-            labels2save.append(labels)
-        for i in range(len(poses2save)):
-            poses2save[i] = poses2save[i].reshape(-1, self.frames_per_clip, 18, 3)  # n_samples, n_frames, n_keypoints, coords
-            labels2save[i] = labels2save[i].reshape(-1, self.frames_per_clip)  # n_samples, n_frames
-            video_paths[i] = (video_paths[i], poses2save[-1].shape[0]*poses2save[-1].shape[1])  # Save str and n_frames
-        poses2save = np.concatenate(poses2save, axis=0)
-        labels2save = np.concatenate(labels2save, axis=0)
-        video_paths = np.array(video_paths)
-        np.save(f'X_{self.set}.npy', poses2save)
-        np.save(f'y_{self.set}.npy', labels2save)
-        np.save(f'vid_paths_{self.set}.npy', video_paths)  # For validating data integrity
-
-    def save_xy_mp(self):
-        """
-        Save the pose sequences per frame and corresponding frame labels (as class indices) using joblib to improve
-        efficiency
-        """
-        num_cores = multiprocessing.cpu_count()
-        # Multi-processing to speed up job
-        output = (Parallel(backend='threading', n_jobs=num_cores)
-                  (delayed(self._collect_xy)(idx, vid_path, labels, n_frames)
-                   for idx, (vid_path, labels, n_frames) in enumerate(self.video_set)))
-        poses2save = []
-        labels2save = []
-        video_paths = []
-        for video in output:
-            poses2save.append(video[0].reshape(-1, self.frames_per_clip, 18, 3))  # n_samples, n_frames, n_keypoints, coords
-            labels = video[1].reshape(-1, self.frames_per_clip)  # n_samples, n_frames
-            for l in labels:  # The clip label is the label that occur the most
+            # Save video clips, labels and pose seqs
+            poses2save.append(poses.reshape((-1, self.frames_per_clip, 18, 3)))  # n_samples, n_frames, n_keypoints, coords
+            labels = labels.reshape((-1, self.frames_per_clip))  # n_samples, n_frames
+            for l in labels:  # Need to obtain one label per samples
                 label = statistics.multimode(l)
-                if len(label) > 1:
-                    if 0 in label:  # Remove 'none' label
-                        label.remove(0)
-                    if 17 in label:  # Remove 'other' label
-                        label.remove(17)
-                    if len(label) != 1:  # Either empty as it (only) contains [0,7] or frame contains more than 1 label
-                        label = [0]
+                if len(label) > 1:  # If we have more than one label for this sample
+                    while (0 in label) and (len(label) > 1):
+                        label.remove(0)  # Remove 'none' label until only one label remains
+                    while (17 in label) and (len(label) > 1):
+                        label.remove(17)  # Remove 'other' label until only one label remains
                 labels2save.append(label[0])
-            video_paths.append((video[2], poses2save[-1].shape[0]*poses2save[-1].shape[1]))  # Save str and n_frames
+            video_paths.append(clips.reshape((-1, self.frames_per_clip)))
 
         poses2save = np.concatenate(poses2save, axis=0)
-        labels2save = np.array(labels2save, dtype=np.long)
-        video_paths = np.array(video_paths)
+        labels2save = np.array(labels2save)
+        video_paths = np.concatenate(video_paths, axis=0)
         np.save(f'X_{self.set}.npy', poses2save)
         np.save(f'y_{self.set}.npy', labels2save)
         np.save(f'vid_paths_{self.set}.npy', video_paths)  # For validating data integrity
 
-    def _collect_xy(self, idx, vid_path, labels, n_frames):
+    def load_poses(self, video_full_path: str, n_frames: int) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Return the pose sequence and corresponding frame labels for the given video_path
-        Args:
-            idx: int | represents the which video in the list is being processed
-            vid_path: string | path to the video/images
-            labels: np array | labels which corresponds to the frame labels given as class index
-            n_frames: int | number of frames in the video
-
-        Returns: tuple | (poses, labels, vid_path). Each row of the poses represent one frame. The no. of rows may be
-        greater than n_frames to ensure divisibility with self.clip_per_frame
-        """
-        print(f"Processing video #{idx+1}/{len(self.video_set)}")
-        poses = self.load_poses(vid_path, n_frames)  # Obtain the pose sequence
-        # Ensure that we have the same amount of frames for the labels and pose seqs. The last frame may have been
-        # duplicated to ensure the sequence of poses for this video is divisible by self.frames_per_clip
-        if labels.shape[0] < poses.shape[0]:
-            rep_val = poses.shape[0] - labels.shape[1]
-            labels = np.hstack((labels, np.tile(labels[:, [-1]], rep_val)))  # Repeat the last labels
-
-        labels = labels.transpose()  # format: n_frames, n_classes
-        labels = np.argmax(labels, axis=1)  # Obtain labels as class index
-        return poses, labels, vid_path
-
-    def load_poses(self, video_full_path, n_frames):
-        """
-        Extracts pose for a specific set of frames. The returned number of sequences in the returned array may have be
-        greater than the given n_frames. This is to ensure that each clip is divisible by the self.frames_per_clip
+        Extracts pose sequence for a given video clip. The returned number of sequences in the returned array may have
+        be greater than the given n_frames. This is to ensure that each clip is divisible by the self.frames_per_clip
         The path to video must be extracted from the output of get_video_frame_labels as it relies on this structure to
         obtain the path to the openpose predictions.
         Args:
             video_full_path: str | path to video obtained from output of get_video_frame_labels
             n_frames: int | represents how many frames the corresponding video contains
 
-        Returns: np array with shape (frames, joints, coordinates)
+        Returns: tuple: np array representing pose seqs with shape (frames, joints, coordinates), np array representing
+        corresponding paths to images where each pose was extracted from
         """
         pose_seq = []
+        clips = []
         pose_path = video_full_path.replace('/data/ikea_asm_dataset_RGB_top_frames', '/annotations/pose_annotations')
         pose_path = pose_path.replace('/images', '/predictions/pose2d/openpose')
         remaining_clips = n_frames % self.frames_per_clip
 
+        # Extract the sequence of poses for this video
         for i in range(n_frames):
             # Obtain the number path to json file (pose annotations for this corresponding video)
             pose_json_filename = os.path.join(pose_path, 'scan_video_' + str(i).zfill(12) + '_keypoints' + '.json')
             with open(pose_json_filename) as json_file:
                 data = json.load(json_file)
+
+            # Obtain corresponding path to clip
+            clip_file_name = os.path.join(video_full_path, str(i).zfill(6) + '.jpg')
+            clips.append(clip_file_name)
 
             # Ensure we obtain the active person's pose sequences
             data = data['people']
@@ -192,13 +150,15 @@ class DataBase:
                 pose = np.array(data[0]['pose_keypoints_2d'])  # x,y,confidence
 
             pose = pose.reshape(-1, 3)  # format: joints, coordinates
-            pose = np.delete(pose, 8, 0)
+            pose = np.delete(pose, 8, 0)  # remove background pose
             pose_seq.append(pose)
 
             # Ensure the sequence of poses is divisible by self.frames_per_clip
             if i+1 == n_frames and remaining_clips != 0:
                 while (len(pose_seq) % self.frames_per_clip) != 0:
                     pose_seq.append(pose)  # Repeat the last pose until it is divisible by frames per clip
+                    clips.append(clip_file_name)  # Repeat last clip until it is divisible by frames per clip
+
 
             # Check skeleton
             # frame1 = np.zeros((1080, 1920, 3), np.uint8)
@@ -216,11 +176,13 @@ class DataBase:
         # pose_seq = pose_seq[:, :, 0:2].unsqueeze(-1)  # format: frames, joints, coordinates, N_people
         # pose_seq = pose_seq.permute(2, 0, 1, 3)  # format: coordinates, frames, joints, N_people
         pose_seq = np.array(pose_seq, dtype=np.float32)  # format: frames, joints, coordinates
+        clips = np.array(clips)
 
-        # Check divisibility of the sequence of poses
-        assert pose_seq.shape[0] >= n_frames and (pose_seq.shape[0] % self.frames_per_clip) == 0
+        # Check same number of pose sequences and check images divisibility of the sequence of poses
+        assert (pose_seq.shape[0] == clips.shape[0] and pose_seq.shape[0] >= n_frames and
+                (pose_seq.shape[0] % self.frames_per_clip) == 0)
 
-        return pose_seq
+        return pose_seq, clips
 
     def get_active_person(self, people, center=(960, 540), min_bbox_area=20000):
         """
@@ -358,5 +320,71 @@ class DataBase:
         return vid_list
 
 
-db = DataBase()
-db.save_xy_mp()
+with DataBase() as db:
+    db.save_xy()
+
+    # def save_xy_mp(self):
+    #     """
+    #     Save the pose sequences per frame and corresponding frame labels (as class indices) using joblib to improve
+    #     efficiency
+    #     """
+    #     # Issues with MKL causing code to hang when using joblib/multi-threading/processing
+    #     os.environ['MKL_NUM_THREADS'] = '1'
+    #     os.environ['OMP_NUM_THREADS'] = '1'
+    #     os.environ['MKL_DYNAMIC'] = 'FALSE'
+    #     num_cores = multiprocessing.cpu_count()
+    #     # Multi-processing to speed up job
+    #     output = (Parallel(backend='threading', n_jobs=6)
+    #               (delayed(self._collect_xy)(idx, vid_path, labels, n_frames)
+    #                for idx, (vid_path, labels, n_frames) in enumerate(self.video_set)))
+    #     poses2save = []
+    #     labels2save = []
+    #     video_paths = []
+    #     for video in output:
+    #         poses2save.append(video[0].reshape(-1, self.frames_per_clip, 18, 3))  # n_samples, n_frames, n_keypoints, coords
+    #         labels = video[1].reshape(-1, self.frames_per_clip)  # n_samples, n_frames
+    #         for l in labels:  # The clip label is the label that occur the most
+    #             if not isinstance(l, list):
+    #                 label = list(l)
+    #             while 0 in label:  # Remove 'none' label in clip
+    #                 label.remove(0)
+    #             while 17 in label:  # Remove 'other' label in clip
+    #                 label.remove(17)
+    #
+    #             if not len(label):  # Label is empty as it (only) contained [0,7]
+    #                 label = [0]
+    #             else:
+    #                 label = statistics.multimode(label)
+    #             labels2save.append(label[0])
+    #         video_paths.append((video[2], poses2save[-1].shape[0]*poses2save[-1].shape[1]))  # Save str and n_frames
+    #
+    #     poses2save = np.concatenate(poses2save, axis=0)
+    #     labels2save = np.array(labels2save, dtype=np.long)
+    #     video_paths = np.array(video_paths)
+    #     np.save(f'X_{self.set}.npy', poses2save)
+    #     np.save(f'y_{self.set}.npy', labels2save)
+    #     np.save(f'vid_paths_{self.set}.npy', video_paths)  # For validating data integrity
+    #
+    # def _collect_xy(self, idx, vid_path, labels, n_frames):
+    #     """
+    #     Return the pose sequence and corresponding frame labels for the given video_path
+    #     Args:
+    #         idx: int | represents the which video in the list is being processed
+    #         vid_path: string | path to the video/images
+    #         labels: np array | labels which corresponds to the frame labels given as class index
+    #         n_frames: int | number of frames in the video
+    #
+    #     Returns: tuple | (poses, labels, vid_path). Each row of the poses represent one frame. The no. of rows may be
+    #     greater than n_frames to ensure divisibility with self.clip_per_frame
+    #     """
+    #     print(f"Processing video #{idx+1}/{len(self.video_set)}")
+    #     poses = self.load_poses(vid_path, n_frames)  # Obtain the pose sequence
+    #     # Ensure that we have the same amount of frames for the labels and pose seqs. The last frame may have been
+    #     # duplicated to ensure the sequence of poses for this video is divisible by self.frames_per_clip
+    #     if labels.shape[0] < poses.shape[0]:
+    #         rep_val = poses.shape[0] - labels.shape[1]
+    #         labels = np.hstack((labels, np.tile(labels[:, [-1]], rep_val)))  # Repeat the last labels
+    #
+    #     labels = labels.transpose()  # format: n_frames, n_classes
+    #     labels = np.argmax(labels, axis=1)  # Obtain labels as class index
+    #     return poses, labels, vid_path
