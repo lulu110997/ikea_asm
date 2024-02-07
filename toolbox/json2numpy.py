@@ -15,8 +15,11 @@ import sqlite3
 
 class DataBase:
     def __init__(self, db_path=None, indexing_files_path=None, set='train'):
+        # dataset_path = '/media/louis/LaCie/IKEA_ASM_DATASET/data/ikea_asm_dataset_RGB_top_frames'
+        default_db_path = '/home/louis/Data/IKEA_ASM_DATASET/annotations/action_annotations/ikea_annotation_db_full'
+        # default_idx_files_path = '/media/louis/LaCie/IKEA_ASM_DATASET/indexing_files'
         dataset_path = '/media/louis/STORAGE/IKEA_ASM_DATASET/data/ikea_asm_dataset_RGB_top_frames'
-        default_db_path = '/media/louis/STORAGE/IKEA_ASM_DATASET/annotations/action_annotations/ikea_annotation_db_full'
+        # default_db_path = '/media/louis/STORAGE/IKEA_ASM_DATASET/annotations/action_annotations/ikea_annotation_db_full'
         default_idx_files_path = '/media/louis/STORAGE/IKEA_ASM_DATASET/indexing_files'
         action_list_filename = 'atomic_action_list.txt'
         action_object_relation_filename = 'action_object_relation_list.txt'
@@ -25,6 +28,9 @@ class DataBase:
         frames_per_clip = 30
         frame_skip = 1
         indexing_files_path = default_idx_files_path if indexing_files_path is None else indexing_files_path
+
+        self.clean_clips = True  # bool for if we want clips with only/majority single action
+        self.cutoff = 0.9  # Used for deciding if a clip is 'clean'
 
         self.db_path = default_db_path if db_path is None else db_path  # Root dir that includes
         self.dataset_path = dataset_path
@@ -53,14 +59,14 @@ class DataBase:
         self.action_list.insert(0, "NA")  #  0 label for unlabled frames
 
         self.num_classes = len(self.action_list)
-        self.trainset_video_list = self.get_list_from_file(self.train_filename)
-        self.testset_video_list = self.get_list_from_file(self.test_filename)
-        self.all_video_list = self.testset_video_list + self.trainset_video_list
+        self.train_video_list = self.get_list_from_file(self.train_filename)
+        self.test_video_list = self.get_list_from_file(self.test_filename)
+        self.all_video_list = self.test_video_list + self.train_video_list
 
         if self.set == 'train':
-            self.video_list = self.trainset_video_list
+            self.video_list = self.train_video_list
         elif self.set == 'test':
-            self.video_list = self.testset_video_list
+            self.video_list = self.test_video_list
 
         self.video_set = self.get_video_frame_labels()
 
@@ -78,30 +84,39 @@ class DataBase:
         Save the pose sequences per frame and corresponding frame labels (as class indices). This function does not use
         joblib (ie performs tasks sequentially/in one process/thread)
         """
+        count_threshold = int(self.frames_per_clip * self.cutoff)
         poses2save = []
         labels2save = []
         video_paths = []
         # Iterate through the set of videos
-        for vid_path, labels, n_frames in tqdm(self.video_set):
+        for vid_path, one_hot_labels, n_frames in tqdm(self.video_set):
             poses, clips = self.load_poses(vid_path, n_frames)  # Obtain the pose sequence for this vid
             # Ensure that we have the same amount of frames for the labels and pose seqs. The last frame may have been
             # duplicated to ensure the sequence of poses for this video is divisible by self.frames_per_clip
-            if labels.shape[0] < poses.shape[0]:
-                rep_val = poses.shape[0] - labels.shape[1]
-                labels = np.hstack((labels, np.tile(labels[:, [-1]], rep_val)))  # Repeat the last labels
-            labels = labels.transpose()  # format: n_frames, n_classes
-            labels = np.argmax(labels, axis=1)  # Obtain labels as class index. format: n_frames
+            if one_hot_labels.shape[0] < poses.shape[0]:
+                rep_val = poses.shape[0] - one_hot_labels.shape[1]
+                one_hot_labels = np.hstack((one_hot_labels, np.tile(one_hot_labels[:, [-1]], rep_val)))  # Repeat the last labels
+            one_hot_labels = one_hot_labels.transpose()  # format: n_frames, n_classes
+            labels = np.argmax(one_hot_labels, axis=1)  # Obtain labels as class index. format: n_frames
 
             # Save video clips, labels and pose seqs
             poses2save.append(poses.reshape((-1, self.frames_per_clip, 18, 3)))  # n_samples, n_frames, n_keypoints, coords
             labels = labels.reshape((-1, self.frames_per_clip))  # n_samples, n_frames
             for l in labels:  # Need to obtain one label per samples
-                label = statistics.multimode(l)
-                if len(label) > 1:  # If we have more than one label for this sample
-                    while (0 in label) and (len(label) > 1):
-                        label.remove(0)  # Remove 'none' label until only one label remains
-                    while (17 in label) and (len(label) > 1):
-                        label.remove(17)  # Remove 'other' label until only one label remains
+                if self.clean_clips:
+                    label, count = np.unique(l, return_counts=True)
+                    idx_pos = np.argmax(count)
+                    if count[idx_pos] > count_threshold:
+                        label = [label[idx_pos]]
+                    else:
+                        label = [-label[idx_pos]]  # To be removed later as this is considered noisy data
+                else:
+                    label = statistics.multimode(l)
+                    if len(label) > 1:  # If we have more than one label for this sample
+                        while (0 in label) and (len(label) > 1):
+                            label.remove(0)  # Remove 'none' label until only one label remains
+                        while (17 in label) and (len(label) > 1):
+                            label.remove(17)  # Remove 'other' label until only one label remains
                 labels2save.append(label[0])
             video_paths.append(clips.reshape((-1, self.frames_per_clip)))
 
