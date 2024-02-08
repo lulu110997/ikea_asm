@@ -14,10 +14,8 @@ import sqlite3
 
 
 class DataBase:
-    def __init__(self, db_path=None, indexing_files_path=None, set='train'):
-        # dataset_path = '/media/louis/LaCie/IKEA_ASM_DATASET/data/ikea_asm_dataset_RGB_top_frames'
+    def __init__(self, db_path=None, indexing_files_path=None, set='test'):
         default_db_path = '/home/louis/Data/IKEA_ASM_DATASET/annotations/action_annotations/ikea_annotation_db_full'
-        # default_idx_files_path = '/media/louis/LaCie/IKEA_ASM_DATASET/indexing_files'
         dataset_path = '/media/louis/STORAGE/IKEA_ASM_DATASET/data/ikea_asm_dataset_RGB_top_frames'
         # default_db_path = '/media/louis/STORAGE/IKEA_ASM_DATASET/annotations/action_annotations/ikea_annotation_db_full'
         default_idx_files_path = '/media/louis/STORAGE/IKEA_ASM_DATASET/indexing_files'
