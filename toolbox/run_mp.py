@@ -19,10 +19,8 @@
 # https://arxiv.org/pdf/2007.00394.pdf
 '''
 import json
-import typing
 from typing import Tuple, Union, Any
-
-from numpy import ndarray, _DType_co, dtype, _ShapeType, void
+from natsort import natsort
 from tqdm import tqdm
 import argparse
 import tb_utils as utils
@@ -33,6 +31,11 @@ import cv2
 import numpy as np
 import sys
 import mediapipe as mp
+# import logging
+# import absl.logging
+# absl.logging.set_verbosity(absl.logging.ERROR)
+# logging.getLogger('mediapipe').setLevel(logging.ERROR)
+# os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
 #Flags for postprocessing exports
 parser = argparse.ArgumentParser()
@@ -51,8 +54,7 @@ if not os.path.exists(OUTPUT_PATH):
     os.makedirs(OUTPUT_PATH)
 
 PATH_TO_MODEL = '/home/louis/Data/Fernandez_HAR/hand_landmarker.task'
-MILLI = 1000
-OFFSET = (10, 10)
+OFFSET = (50, 50)  # (y,x)
 
 BaseOptions = mp.tasks.BaseOptions
 HandLandmarker = mp.tasks.vision.HandLandmarker
@@ -66,9 +68,7 @@ options = HandLandmarkerOptions(
     min_hand_detection_confidence=0.1,
     min_hand_presence_confidence=0.1,
     min_tracking_confidence=0.1)
-
-
-def crop_img(img: np.ndarray, pose: np.ndarray) -> Tuple[...]:
+def _get_hand_pose(img: np.ndarray, pose: np.ndarray) -> Tuple[Any]:
     """
     Args:
         img (np.ndarray): represents
@@ -76,151 +76,142 @@ def crop_img(img: np.ndarray, pose: np.ndarray) -> Tuple[...]:
 
     Returns: Tuple[...] : me
     """
+    assert pose.shape == (18, 3)
+    left_hand = None
+    right_hand = None
+    wrists = np.concatenate((pose[3, :].reshape(-1,3), pose[3, :].reshape(-1,3)), axis=0)
+    x_min, x_max = round(np.min(wrists[:, 0])), round(np.max(wrists[:, 0]))
+    x_offset = 0
+    y_min, y_max = round(np.min(wrists[:, 1])), round(np.max(wrists[:, 1]))
+    y_offset = img.shape[1] - (y_max+OFFSET[1])
+    l_cropped_img = img[y_min-OFFSET[0]:y_max+OFFSET[0], x_min-OFFSET[1]:x_max+OFFSET[1]]
+    r_cropped_img = img[y_min-OFFSET[0]:y_max+OFFSET[0], x_min-OFFSET[1]:x_max+OFFSET[1]]
+    crop_width, crop_height = cropped_img.shape[:2]
+    cv2.imshow("cropped_img", cropped_img)
+    for ij in pose:
+        cv2.circle(img, (round(ij[0]), round(ij[1])), 3, (255, 255, 255), 1)
+    # cv2.imshow("org", img) TODO: check img size of mediapipe, use images that have hand skeleton extracted
+    cv2.waitKey(1)
 
-    x_min = 100000
-    x_max = 0
-    y_min = 100000
-    y_max = 0
+    with HandLandmarker.create_from_options(options) as landmarker:
+        # Perform hand landmarks detection on the provided single image.
+        # The hand landmarker must be created with the image mode.
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=np.array(cropped_img))
+        hand_landmarker_result = landmarker.detect(mp_image)
+        print(len(hand_landmarker_result.hand_landmarks))
+        for i in range(len(hand_landmarker_result.hand_landmarks)):
+            conf = hand_landmarker_result.handedness[i][0].score
+            tmp_kp = map(lambda k, w=crop_width, h=crop_height, c=conf, x=x_offset, y=y_offset:
+                         (k.x*h + y, k.y*w, c), hand_landmarker_result.hand_landmarks[i])
 
-    for i in pose:
-        if i[0, 0] < x_min:
-            x_min = i[0, 0]
-        if i[0, 1] < y_min:
-            y_min = i[0, 1]
+            if hand_landmarker_result.handedness[i][0].category_name == 'Left':
+                left_hand = np.array(list(tmp_kp))
+            elif hand_landmarker_result.handedness[i][0].category_name == 'Right':
+                right_hand = np.array(list(tmp_kp))
+        # if len(hand_landmarker_result.hand_landmarks) > 1:
+        #     print(len(hand_landmarker_result.hand_landmarks))
+        #     for ij in left_hand:
+        #         cv2.circle(img, (round(ij[0]), round(ij[1])), 3, (255, 255, 255), 1)
+        #     for ij in right_hand:
+        #         cv2.circle(img, (round(ij[0]), round(ij[1])), 3, (122, 76, 255), 1)
+        #     cv2.imshow("org", img)
+        #     cv2.waitKey(0)
+            p=1
+    # cv2.imshow("cropped_img", cropped_img)
+    # for ij in pose:
+        # cv2.circle(img, (round(ij[0]), round(ij[1])), 3, (255, 255, 255), 1)
 
-        if i[0, 0] > x_max:
-            x_max = i[0, 0]
-        if i[0, 1] > y_max:
-            y_max = i[0, 1]
+    # output_filename = filename.replace(INPUT_PATH, OUTPUT_PATH)
+    # output_dir_path = os.path.dirname(os.path.abspath(output_filename))
+    # if not os.path.exists(output_filename):
+    #     os.makedirs(output_dir_path, exist_ok=True)
+    #
+    # # Save result
+    # json_file = convert2json(hand_landmarker_result)
+    #
+    # return (img_offsets, img)  # noqa
 
-    img_offsets = (y_min-OFFSET[0], y_max+OFFSET[0], x_min-OFFSET[1], x_max+OFFSET[1])
-    img = img[y_min-OFFSET[0]:y_max+OFFSET[0], x_min-OFFSET[1]:x_max+OFFSET[1]]
 
-    return (img_offsets, img)  # noqa
-
-
-def save_hand_skeleton(filename):
+def extract_hand_pose(video_full_path: str, pose_json_path: str):
     """
     Obtain the hand skeleton and save to output directory
     Args:
-        filename: string | path to image
+        video_full_path: string | path to dir containing video frames
+        pose_json_path: str | path to dir containing pose annotations
     """
-    with HandLandmarker.create_from_options(options) as landmarker:
-        pose = ...
-        cv_image = cv2.cvtColor(cv2.imread(filename), cv2.COLOR_BGR2RGB)
-        cv_image = crop_img(cv_image, pose)
-        cv2.imshow('win', cv_image)
-        cv2.waitKey(-1)
-        cv2.destroyAllWindows()
-        # print(filename); sys.exit()
+    previous_body_pose = None  # Store body skeleton pose from previous frame
+    json_annotations_paths = natsort.natsorted(map(lambda x: os.path.join(pose_json_path, x), os.listdir(pose_json_path)))#[45:]
+    video_frames_paths = natsort.natsorted(map(lambda x: os.path.join(video_full_path, x), os.listdir(video_full_path)))#[45:]
+    assert all(map(lambda x: os.path.isfile(x), json_annotations_paths)); assert all(map(lambda x: os.path.isfile(x), video_frames_paths))
+    assert len(json_annotations_paths) == len(video_frames_paths)
+    n_frames = len(video_frames_paths)
+    remaining_clips = n_frames % 30 #self.frames_per_clip  # TODO: change this to attr
+    # cv2.namedWindow("org"); cv2.namedWindow("cropped_img"); input()
 
-        # Perform hand landmarks detection on the provided single image.
-        # The hand landmarker must be created with the image mode.
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=np.array(cv_image))
-        hand_landmarker_result = landmarker.detect(mp_image)
-        print(hand_landmarker_result); sys.exit()
+    for f, j in zip(video_frames_paths, json_annotations_paths):
+        with open(j) as json_file:
+            data = json.load(json_file)
+            data = data['people']
+            if len(data) > 1:
+                pose = get_active_person(data, center=(960, 540), min_bbox_area=20000)
+            else:
+                pose = np.array(data[0]['pose_keypoints_2d'])  # x,y,confidence
+        pose = pose.reshape(-1, 3)  # format: joints, coordinates
+        pose = np.delete(pose, 8, 0)  # remove background pose
 
-    output_filename = filename.replace(INPUT_PATH, OUTPUT_PATH)
-    output_dir_path = os.path.dirname(os.path.abspath(output_filename))
-    if not os.path.exists(output_filename):
-        os.makedirs(output_dir_path, exist_ok=True)
+        # If keypoint is zero, use previous keypoint location
+        if any((pose < 1e-6).flatten()):
+            pose[pose < 1e-6] = previous_poses[pose < 1e-6]
+        previous_poses = pose.copy()  # TODO: make an attr
+        img = cv2.imread(f)
+        _get_hand_pose(img, pose)
 
-    # Save result
-    json_file = convert2json(hand_landmarker_result)
+    cv2.destroyAllWindows()
+    print("done")
 
 
-def convert2json(result):
+def get_active_person(people, center=(960, 540), min_bbox_area=20000):
     """
-    Convert hand landmarker result from mediapipe to have similar structure as openpose json file
-    Args:
-        result: mediapipe's hand landmarker result | output of fn for detecting the hand skeleton
-    """
-    # z (depth) can be extracted from the depth images
-    # Need the form xn, yn, cn. Use only the un-normalised projected values
-    print(result.handedness)
-    # sys.exit()
-    json_data = {
-        "version": 1.3,
-        "people": [
-            {
-                "person_id": [-1],
-                "hand_left_keypoints_2d": [],
-                "hand_right_keypoints_2d": []
-            }
-        ]
-    }
+       Select the active skeleton in the scene by applying a heuristic of findng the closest one to the center of the frame
+       then take it only if its bounding box is large enough - eliminates small bbox like kids
+       Assumes 100 * 200 minimum size of bounding box to consider
+       Parameters
+       ----------
+       data : pose data extracted from json file
+       center: center of image (x, y)
+       min_bbox_area: minimal bounding box area threshold
 
-    return json_data
+       Returns
+       -------
+       pose: skeleton of the active person in the scene (flattened)
+       """
 
-file_list = utils.get_list_of_all_files(INPUT_PATH, file_type='.jpg')
-print(len(file_list))
-# for i in file_list[600:]:
-#     save_hand_skeleton(i)
+    pose = None
+    min_dtc = float('inf')  # dtc = distance to center
+    for person in people:
+        current_pose = np.array(person['pose_keypoints_2d'])
+        joints_2d = np.reshape(current_pose, (-1, 3))[:, :2]
+        if 'boxes' in person.keys():
+            # maskrcnn
+            bbox = person['boxes']
+        else:
+            # openpose
+            idx = np.where(joints_2d.any(axis=1))[0]
+            bbox = [np.min(joints_2d[idx, 0]),
+                    np.min(joints_2d[idx, 1]),
+                    np.max(joints_2d[idx, 0]),
+                    np.max(joints_2d[idx, 1])]
 
-mpose_sample = np.load('/home/louis/.mpose/openpose/1/X_test.npy')
-# print(mpose_sample[0].shape, mpose_sample[0,0,:,:])
-seq_list =[]
-for seq in mpose_sample:
-    v1 = np.zeros((30 + 1, seq.shape[1], 3 - 1))
-    v2 = np.zeros((30 + 1, seq.shape[1], 3 - 1))
-    v1[1:, ...] = seq[:, :, :2]
-    v2[:30, ...] = seq[:, :, :2]
-    vel = (v2 - v1)[:-1, ...]
-    data = np.concatenate((seq[:, :, :2], vel), axis=-1)
-    data = np.concatenate((data, seq[:, :, -1:]), axis=-1)
-    seq_list.append(data)
-X_train = np.stack(seq_list)
-s='asd'
-with open('/media/louis/STORAGE/IKEA_ASM_DATASET/annotations/pose_annotations/Kallax_Shelf_Drawer/'
-          '0001_black_table_02_01_2019_08_16_14_00/dev3/predictions/pose2d/openpose/'
-          'scan_video_000000000000_keypoints.json') as file:
-    ikea_openpose = json.load(file)['people'][0]['pose_keypoints_2d']
-# print(len(ikea_openpose)/3)
-# tmp = [995.1219512195122, 228.91304347826087, 0.9787825345993042,
-#        1030.2439024390244, 270.0, 0.9344065189361572,
-#        965.8536585365854, 275.8695652173913, 0.8997037410736084,
-#        945.3658536585366, 369.7826086956522, 0.9310221076011658,
-#        954.1463414634146, 451.95652173913044, 0.9304882884025574,
-#        1091.7073170731708, 267.0652173913043, 0.936791181564331,
-#        1123.90243902439, 360.9782608695652, 0.9447482228279114,
-#        1115.1219512195123, 451.95652173913044, 0.9820445775985718,
-#        0, 0, 0,
-#        1000.9756097560976, 451.95652173913044, 0.748716413974762,
-#        1021.4634146341463, 584.0217391304348, 0.806501030921936,
-#        1027.3170731707316, 669.1304347826086, 0.5967968702316284,
-#        1085.8536585365853, 446.0869565217391, 0.7661957144737244,
-#        1088.780487804878, 578.1521739130435, 0.7979868650436401,
-#        1094.6341463414633, 666.1956521739131, 0.593521773815155,
-#        992.1951219512194, 214.2391304347826, 1.064151406288147,
-#        1012.6829268292684, 217.17391304347828, 0.9416921138763428,
-#        998.0487804878048, 202.5, 0.7074303030967712,
-#        1047.8048780487807, 211.30434782608697, 0.9728320240974426]
+        A = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])  # bbox area
+        bbox_center = (bbox[0] + (bbox[2] - bbox[0]) / 2, bbox[1] + (bbox[3] - bbox[1]) / 2)  # bbox center
 
-
-# # compress each scan individually and maintain directory tree structure - parallel to speed it up
-# with Pool(8) as p:
-#   list(tqdm(p.imap(get_hand_skeleton, file_list), total=len(file_list)))
-
-
-# def shrink_and_save(filename):
-#     # saves and shrinks a file from the dataset.
-#     # if the file already exists in the output directory - skip it.
-#
-#     output_filename = filename.replace(INPUT_PATH, OUTPUT_PATH)
-#     output_dir_path = os.path.dirname(os.path.abspath(output_filename))
-#     if not os.path.exists(output_filename):
-#         os.makedirs(output_dir_path, exist_ok=True)
-#
-#         if FLAGS.mode == 'depth':
-#             img = cv2.imread(filename, cv2.IMREAD_ANYDEPTH).astype(np.float32)
-#             img = img * 255 / 4500
-#             # img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
-#             img = cv2.resize(img, dsize=(int(img.shape[0] / SHRINK_FACTOR), int(img.shape[1] / SHRINK_FACTOR)))
-#             cv2.imwrite(output_filename, img)
-#         else:
-#             # shrink and save the data
-#             img = Image.open(filename)
-#             img = img.resize((int(img.size[0] / SHRINK_FACTOR), int(img.size[1] / SHRINK_FACTOR)))
-#             img.save(output_filename)
-
-
+        dtc = np.sqrt(np.sum((np.array(bbox_center) - np.array(center)) ** 2))
+        if dtc < min_dtc:
+            closest_pose = current_pose
+            if A > min_bbox_area:
+                pose = closest_pose
+                min_dtc = dtc
+    # if all bboxes are smaller than threshold, take the closest
+    if pose is None:
+        pose = closest_pose
+    return pose

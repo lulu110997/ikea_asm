@@ -3,8 +3,10 @@ TODO: Figure out multiclass labelling
 TODO: Figure out why label is sometimes None
 TODO: Validate the exported npy data
 """
+import sys
 from typing import Tuple, List
 from tqdm import tqdm
+import run_mp as _mp
 from scipy import stats
 import json
 import os
@@ -23,11 +25,11 @@ class DataBase:
         action_object_relation_filename = 'action_object_relation_list.txt'
         train_filename = 'train_cross_env.txt'
         test_filename = 'test_cross_env.txt'
-        frames_per_clip = 30
+        frames_per_clip = 24
         frame_skip = 1
         indexing_files_path = default_idx_files_path if indexing_files_path is None else indexing_files_path
 
-        self.clean_clips = True  # bool for if we want clips with only/majority single action
+        self.clean_clips = False  # bool for if we want clips with only/majority single action
         self.cutoff = 0.9  # Used for deciding if a clip is 'clean'
 
         self.db_path = default_db_path if db_path is None else db_path  # Root dir that includes
@@ -87,43 +89,52 @@ class DataBase:
         labels2save = []
         video_paths = []
         # Iterate through the set of videos
+        import random
+        # At train set and seed = 4291875399169780595, body skeleton output is noisy, some keypoints are zero
+        # At train set and seed = 4449171482366725545, dude wears a dino costume
+        # At train set and seed = 8593154336248771781, trouble finding hands with OFFSET = (65, 55), changed to (10, 50)
+        # At train set and seed = 7685408866053192944, trouble finding hands with OFFSET = (10, 50) as person is squatting. changed to (50, 50)
+        # seed = random.randrange(sys.maxsize)
+        # rng = random.Random(seed)
+        # print("Seed was:", seed)
+        # rng.shuffle(self.video_set)
         for vid_path, one_hot_labels, n_frames in tqdm(self.video_set):
             poses, clips = self.load_poses(vid_path, n_frames)  # Obtain the pose sequence for this vid
-            # Ensure that we have the same amount of frames for the labels and pose seqs. The last frame may have been
-            # duplicated to ensure the sequence of poses for this video is divisible by self.frames_per_clip
-            if one_hot_labels.shape[0] < poses.shape[0]:
-                rep_val = poses.shape[0] - one_hot_labels.shape[1]
-                one_hot_labels = np.hstack((one_hot_labels, np.tile(one_hot_labels[:, [-1]], rep_val)))  # Repeat the last labels
-            one_hot_labels = one_hot_labels.transpose()  # format: n_frames, n_classes
-            labels = np.argmax(one_hot_labels, axis=1)  # Obtain labels as class index. format: n_frames
-
-            # Save video clips, labels and pose seqs
-            poses2save.append(poses.reshape((-1, self.frames_per_clip, 18, 3)))  # n_samples, n_frames, n_keypoints, coords
-            labels = labels.reshape((-1, self.frames_per_clip))  # n_samples, n_frames
-            for l in labels:  # Need to obtain one label per samples
-                if self.clean_clips:
-                    label, count = np.unique(l, return_counts=True)
-                    idx_pos = np.argmax(count)
-                    if count[idx_pos] > count_threshold:
-                        label = [label[idx_pos]]
-                    else:
-                        label = [-label[idx_pos]]  # To be removed later as this is considered noisy data
-                else:
-                    label = statistics.multimode(l)
-                    if len(label) > 1:  # If we have more than one label for this sample
-                        while (0 in label) and (len(label) > 1):
-                            label.remove(0)  # Remove 'none' label until only one label remains
-                        while (17 in label) and (len(label) > 1):
-                            label.remove(17)  # Remove 'other' label until only one label remains
-                labels2save.append(label[0])
-            video_paths.append(clips.reshape((-1, self.frames_per_clip)))
-
-        poses2save = np.concatenate(poses2save, axis=0)
-        labels2save = np.array(labels2save)
-        video_paths = np.concatenate(video_paths, axis=0)
-        np.save(f'X_{self.set}.npy', poses2save)
-        np.save(f'y_{self.set}.npy', labels2save)
-        np.save(f'vid_paths_{self.set}.npy', video_paths)  # For validating data integrity
+        #     # Ensure that we have the same amount of frames for the labels and pose seqs. The last frame may have been
+        #     # duplicated to ensure the sequence of poses for this video is divisible by self.frames_per_clip
+        #     if one_hot_labels.shape[0] < poses.shape[0]:
+        #         rep_val = poses.shape[0] - one_hot_labels.shape[1]
+        #         one_hot_labels = np.hstack((one_hot_labels, np.tile(one_hot_labels[:, [-1]], rep_val)))  # Repeat the last labels
+        #     one_hot_labels = one_hot_labels.transpose()  # format: n_frames, n_classes
+        #     labels = np.argmax(one_hot_labels, axis=1)  # Obtain labels as class index. format: n_frames
+        #
+        #     # Save video clips, labels and pose seqs
+        #     poses2save.append(poses.reshape((-1, self.frames_per_clip, 18, 3)))  # n_samples, n_frames, n_keypoints, coords
+        #     labels = labels.reshape((-1, self.frames_per_clip))  # n_samples, n_frames
+        #     for l in labels:  # Need to obtain one label per samples
+        #         if self.clean_clips:
+        #             label, count = np.unique(l, return_counts=True)
+        #             idx_pos = np.argmax(count)
+        #             if count[idx_pos] > count_threshold:
+        #                 label = [label[idx_pos]]
+        #             else:
+        #                 label = [-label[idx_pos]]  # To be removed later as this is considered noisy data
+        #         else:
+        #             label = statistics.multimode(l)
+        #             if len(label) > 1:  # If we have more than one label for this sample
+        #                 while (0 in label) and (len(label) > 1):
+        #                     label.remove(0)  # Remove 'none' label until only one label remains
+        #                 while (17 in label) and (len(label) > 1):
+        #                     label.remove(17)  # Remove 'other' label until only one label remains
+        #         labels2save.append(label[0])
+        #     video_paths.append(clips.reshape((-1, self.frames_per_clip)))
+        #
+        # poses2save = np.concatenate(poses2save, axis=0)
+        # labels2save = np.array(labels2save)
+        # video_paths = np.concatenate(video_paths, axis=0)
+        # np.save(f'X_{self.set}.npy', poses2save)
+        # np.save(f'y_{self.set}.npy', labels2save)
+        # np.save(f'vid_paths_{self.set}.npy', video_paths)  # For validating data integrity
 
     def load_poses(self, video_full_path: str, n_frames: int) -> Tuple[np.ndarray, np.ndarray]:
         """
@@ -133,6 +144,7 @@ class DataBase:
         obtain the path to the openpose predictions.
         Args:
             video_full_path: str | path to video obtained from output of get_video_frame_labels
+            (eg 'IKEA_ASM_DATASET/data/ikea_asm_dataset_RGB_top_frames/Lack_TV_Bench/0025_black_table_04_02_2019_08_20_13_48/dev3/images')
             n_frames: int | represents how many frames the corresponding video contains
 
         Returns: tuple: np array representing pose seqs with shape (frames, joints, coordinates), np array representing
@@ -143,7 +155,8 @@ class DataBase:
         pose_path = video_full_path.replace('/data/ikea_asm_dataset_RGB_top_frames', '/annotations/pose_annotations')
         pose_path = pose_path.replace('/images', '/predictions/pose2d/openpose')
         remaining_clips = n_frames % self.frames_per_clip
-
+        _mp.extract_hand_pose(video_full_path, pose_path)
+        sys.exit()
         # Extract the sequence of poses for this video
         for i in range(n_frames):
             # Obtain the number path to json file (pose annotations for this corresponding video)
