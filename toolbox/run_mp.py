@@ -31,7 +31,7 @@ import os
 # logging.getLogger('tensorflow').setLevel(logging.ERROR)
 # logging.getLogger('absl').setLevel(logging.ERROR)
 import logging
-logging.basicConfig(filename='example.log', level=logging.INFO)
+logging.basicConfig(filename='train.log', level=logging.INFO)
 
 import json
 import argparse

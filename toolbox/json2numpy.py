@@ -16,7 +16,7 @@ import sqlite3
 
 
 class DataBase:
-    def __init__(self, db_path=None, indexing_files_path=None, set='test'):
+    def __init__(self, db_path=None, indexing_files_path=None, set='train'):
         default_db_path = '/home/louis/Data/IKEA_ASM_DATASET/annotations/action_annotations/ikea_annotation_db_full'
         dataset_path = '/media/louis/STORAGE/IKEA_ASM_DATASET/data/ikea_asm_dataset_RGB_top_frames'
         # default_db_path = '/media/louis/STORAGE/IKEA_ASM_DATASET/annotations/action_annotations/ikea_annotation_db_full'
@@ -84,6 +84,7 @@ class DataBase:
         Save the pose sequences per frame and corresponding frame labels (as class indices). This function does not use
         joblib (ie performs tasks sequentially/in one process/thread)
         """
+        num_kp = 60 if hands else 18
         count_threshold = int(self.frames_per_clip * self.cutoff)
         poses2save = []
         labels2save = []
@@ -100,7 +101,7 @@ class DataBase:
             labels = np.argmax(one_hot_labels, axis=1)  # Obtain labels as class index. format: n_frames
 
             # Save video clips, labels and pose seqs
-            poses2save.append(poses.reshape((-1, self.frames_per_clip, 18, 3)))  # n_samples, n_frames, n_keypoints, coords
+            poses2save.append(poses.reshape((-1, self.frames_per_clip, num_kp, 3)))  # n_samples, n_frames, n_keypoints, coords
             labels = labels.reshape((-1, self.frames_per_clip))  # n_samples, n_frames
             for l in labels:  # Need to obtain one label per samples
                 if self.clean_clips:
