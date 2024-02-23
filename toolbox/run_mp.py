@@ -18,43 +18,29 @@
 # labeled data, and triangulating the detections of the model from the three calibrated camera views
 # https://arxiv.org/pdf/2007.00394.pdf
 '''
-import json
-from typing import Tuple, Union, Any
+from typing import Tuple, List, Any
 from natsort import natsort
 from tqdm import tqdm
-import argparse
-import tb_utils as utils
 import os
-from PIL import Image
-from multiprocessing import Pool
-import cv2
-import numpy as np
-import sys
-import mediapipe as mp
+# os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+# os.environ['GLOG_minloglevel'] = '3'
 # import logging
 # import absl.logging
 # absl.logging.set_verbosity(absl.logging.ERROR)
 # logging.getLogger('mediapipe').setLevel(logging.ERROR)
-# os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+# logging.getLogger('tensorflow').setLevel(logging.ERROR)
+# logging.getLogger('absl').setLevel(logging.ERROR)
+import logging
+logging.basicConfig(filename='example.log', level=logging.INFO)
 
-#Flags for postprocessing exports
-parser = argparse.ArgumentParser()
-parser.add_argument('--input_path', type=str,
-                    default='/media/louis/STORAGE/IKEA_ASM_DATASET/data/ikea_asm_dataset_RGB_top_frames',
-                    help='path to the ANU IKEA dataset')
-parser.add_argument('--output_path', type=str,
-                    default='/media/louis/STORAGE/IKEA_ASM_DATASET/data/tmp',
-                    help='path to the ANU IKEA dataset')
-FLAGS = parser.parse_args()
-
-INPUT_PATH = FLAGS.input_path
-OUTPUT_PATH = FLAGS.output_path
-
-if not os.path.exists(OUTPUT_PATH):
-    os.makedirs(OUTPUT_PATH)
+import json
+import argparse
+import cv2
+import numpy as np
+import mediapipe as mp
 
 PATH_TO_MODEL = '/home/louis/Data/Fernandez_HAR/hand_landmarker.task'
-OFFSET = (50, 50)  # (y,x)
+OFFSET = 120  # (y,x)
 
 BaseOptions = mp.tasks.BaseOptions
 HandLandmarker = mp.tasks.vision.HandLandmarker
@@ -68,85 +54,98 @@ options = HandLandmarkerOptions(
     min_hand_detection_confidence=0.1,
     min_hand_presence_confidence=0.1,
     min_tracking_confidence=0.1)
-def _get_hand_pose(img: np.ndarray, pose: np.ndarray) -> Tuple[Any]:
+
+
+def _get_hand_pose(img: np.ndarray, pose: np.ndarray, prev_hands) -> Tuple[Any, Any]:
     """
     Args:
-        img (np.ndarray): represents
-        pose (np.ndarray):
+        img: np.ndarray | represents an image to extract hand pose from
+        pose: np.ndarray | represents the body pose
+        prev_hands list | represents the previous hand pose. Assumes order [left_hand, right_hand]
 
-    Returns: Tuple[...] : me
+    Returns: Tuple[Any, Any]: hand pose with order (left_hand, right_hand)
     """
-    assert pose.shape == (18, 3)
-    left_hand = None
-    right_hand = None
-    wrists = np.concatenate((pose[3, :].reshape(-1,3), pose[3, :].reshape(-1,3)), axis=0)
+    left_hand = prev_hands[0]
+    right_hand = prev_hands[1]
+    wrists = np.concatenate((pose[4, :].reshape(-1, 3), pose[7, :].reshape(-1, 3)), axis=0)
     x_min, x_max = round(np.min(wrists[:, 0])), round(np.max(wrists[:, 0]))
-    x_offset = 0
     y_min, y_max = round(np.min(wrists[:, 1])), round(np.max(wrists[:, 1]))
-    y_offset = img.shape[1] - (y_max+OFFSET[1])
-    l_cropped_img = img[y_min-OFFSET[0]:y_max+OFFSET[0], x_min-OFFSET[1]:x_max+OFFSET[1]]
-    r_cropped_img = img[y_min-OFFSET[0]:y_max+OFFSET[0], x_min-OFFSET[1]:x_max+OFFSET[1]]
+    a1_s = 0 if y_min-OFFSET < 0 else y_min-OFFSET
+    a1_f = img.shape[0] if y_max + OFFSET > img.shape[0] else y_max + OFFSET
+    a2_s = 0 if x_min-OFFSET < 0 else x_min-OFFSET
+    a2_f = img.shape[1] if x_max + OFFSET > img.shape[0] else x_max + OFFSET
+    cropped_img = img[a1_s:a1_f, a2_s:a2_f]
     crop_width, crop_height = cropped_img.shape[:2]
-    cv2.imshow("cropped_img", cropped_img)
-    for ij in pose:
-        cv2.circle(img, (round(ij[0]), round(ij[1])), 3, (255, 255, 255), 1)
-    # cv2.imshow("org", img) TODO: check img size of mediapipe, use images that have hand skeleton extracted
-    cv2.waitKey(1)
+    x_offset = y_min - OFFSET
+    y_offset = x_min - OFFSET
 
     with HandLandmarker.create_from_options(options) as landmarker:
         # Perform hand landmarks detection on the provided single image.
-        # The hand landmarker must be created with the image mode.
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=np.array(cropped_img))
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB,
+                            data=np.array(cv2.cvtColor(cropped_img, cv2.COLOR_BGR2RGB)))
         hand_landmarker_result = landmarker.detect(mp_image)
-        print(len(hand_landmarker_result.hand_landmarks))
         for i in range(len(hand_landmarker_result.hand_landmarks)):
             conf = hand_landmarker_result.handedness[i][0].score
             tmp_kp = map(lambda k, w=crop_width, h=crop_height, c=conf, x=x_offset, y=y_offset:
-                         (k.x*h + y, k.y*w, c), hand_landmarker_result.hand_landmarks[i])
+                         (k.x*h + y, k.y*w + x, c), hand_landmarker_result.hand_landmarks[i])
 
             if hand_landmarker_result.handedness[i][0].category_name == 'Left':
                 left_hand = np.array(list(tmp_kp))
             elif hand_landmarker_result.handedness[i][0].category_name == 'Right':
                 right_hand = np.array(list(tmp_kp))
-        # if len(hand_landmarker_result.hand_landmarks) > 1:
-        #     print(len(hand_landmarker_result.hand_landmarks))
-        #     for ij in left_hand:
-        #         cv2.circle(img, (round(ij[0]), round(ij[1])), 3, (255, 255, 255), 1)
-        #     for ij in right_hand:
-        #         cv2.circle(img, (round(ij[0]), round(ij[1])), 3, (122, 76, 255), 1)
-        #     cv2.imshow("org", img)
-        #     cv2.waitKey(0)
-            p=1
-    # cv2.imshow("cropped_img", cropped_img)
+    left_hand, right_hand = check_hand_pose([left_hand, right_hand], [wrists[1, :],
+                                                                      wrists[0, :]], prev_hands)
+
+    # for ij in left_hand:
+    #     cv2.circle(img, (round(ij[0]), round(ij[1])), 2, (76, 255, 122), 2)
+    # for ij in right_hand:
+    #     cv2.circle(img, (round(ij[0]), round(ij[1])), 2, (122, 76, 255), 2)
     # for ij in pose:
-        # cv2.circle(img, (round(ij[0]), round(ij[1])), 3, (255, 255, 255), 1)
+    #     cv2.circle(img, (round(ij[0]), round(ij[1])), 1, (255, 255, 255), 1)
+    # cv2.imshow("org", img)
+    # cv2.imshow("cropped_img", cropped_img)
+    # cv2.waitKey(1)
 
-    # output_filename = filename.replace(INPUT_PATH, OUTPUT_PATH)
-    # output_dir_path = os.path.dirname(os.path.abspath(output_filename))
-    # if not os.path.exists(output_filename):
-    #     os.makedirs(output_dir_path, exist_ok=True)
-    #
-    # # Save result
-    # json_file = convert2json(hand_landmarker_result)
-    #
-    # return (img_offsets, img)  # noqa
+    return left_hand.copy(), right_hand.copy()
 
 
-def extract_hand_pose(video_full_path: str, pose_json_path: str):
+def check_hand_pose(hands_pose, wrists_pose, prev_hands):
+    for i in range(2):
+        if hands_pose[i] is None:
+            # If nothing was extracted for this hand, set the pose to be the same as either wrist pose or previous hand
+            # pose
+            if prev_hands[i] is None:
+                hands_pose[i] = np.full((21, 3), wrists_pose[i])
+                continue
+            else:
+                hands_pose[i] = prev_hands[i].copy()
+
+        # Check that the wrist of the current pose is close to the body wrist pose. If distance > 50, we set the hand pose
+        # to be the wrist pose. This happens when mp incorrectly predicts left hand to be right hand (or vice-versa)
+        if np.linalg.norm(hands_pose[i][0, :2] - wrists_pose[i][:2]) > 20:
+            hands_pose[i] = np.full((21, 3), wrists_pose[i])
+    return hands_pose
+
+
+def extract_hand_pose(video_full_path: str, pose_json_path: str, frames_per_clip: int = 30):
     """
     Obtain the hand skeleton and save to output directory
     Args:
         video_full_path: string | path to dir containing video frames
         pose_json_path: str | path to dir containing pose annotations
+        frames_per_clip: int | number of frames each clip contains
     """
-    previous_body_pose = None  # Store body skeleton pose from previous frame
-    json_annotations_paths = natsort.natsorted(map(lambda x: os.path.join(pose_json_path, x), os.listdir(pose_json_path)))#[45:]
-    video_frames_paths = natsort.natsorted(map(lambda x: os.path.join(video_full_path, x), os.listdir(video_full_path)))#[45:]
+    logging.info(f"{video_full_path}")
+    pose_seq = []
+    clips = []
+    previous_body_pose = np.full((18, 3), 0)  # Store body skeleton pose from previous frame
+    prev_left_h, prev_right_h = None, None
+    json_annotations_paths = natsort.natsorted(map(lambda x: os.path.join(pose_json_path, x), os.listdir(pose_json_path)))#[::2]
+    video_frames_paths = natsort.natsorted(map(lambda x: os.path.join(video_full_path, x), os.listdir(video_full_path)))#[::2]
     assert all(map(lambda x: os.path.isfile(x), json_annotations_paths)); assert all(map(lambda x: os.path.isfile(x), video_frames_paths))
     assert len(json_annotations_paths) == len(video_frames_paths)
     n_frames = len(video_frames_paths)
-    remaining_clips = n_frames % 30 #self.frames_per_clip  # TODO: change this to attr
-    # cv2.namedWindow("org"); cv2.namedWindow("cropped_img"); input()
+    remaining_clips = n_frames % frames_per_clip
 
     for f, j in zip(video_frames_paths, json_annotations_paths):
         with open(j) as json_file:
@@ -161,13 +160,33 @@ def extract_hand_pose(video_full_path: str, pose_json_path: str):
 
         # If keypoint is zero, use previous keypoint location
         if any((pose < 1e-6).flatten()):
-            pose[pose < 1e-6] = previous_poses[pose < 1e-6]
-        previous_poses = pose.copy()  # TODO: make an attr
-        img = cv2.imread(f)
-        _get_hand_pose(img, pose)
+            pose[pose < 1e-6] = previous_body_pose[pose < 1e-6]
+        previous_body_pose = pose.copy()
+        prev_left_h, prev_right_h = _get_hand_pose(cv2.imread(f), pose, [prev_left_h, prev_right_h])
+        pose_seq.append(np.concatenate((previous_body_pose, prev_left_h, prev_right_h), axis=0))
+        clips.append(f)
 
-    cv2.destroyAllWindows()
-    print("done")
+        # Check skeleton
+        # frame1 = cv2.imread(f)
+        # for i, point in enumerate(pose_seq[-1]):
+        #     cv2.circle(frame1, (int(point[0]), int(point[1])), 1, (0, 0, 255))
+        # cv2.imshow('fra', frame1)
+        # cv2.waitKey(0)
+
+    # Ensure the sequence of poses is divisible by self.frames_per_clip
+    if remaining_clips != 0:
+        while (len(pose_seq) % frames_per_clip) != 0:
+            pose_seq.append(pose_seq[-1].copy())  # Repeat the last pose until it is divisible by frames per clip
+            clips.append(clips[-1])  # Repeat last clip until it is divisible by frames per clip
+
+    pose_seq = np.array(pose_seq, dtype=np.float32)  # format: frames, joints, coordinates
+    clips = np.array(clips)
+
+    # Check same number of pose sequences and check images divisibility of the sequence of poses
+    assert (pose_seq.shape[0] == clips.shape[0] and pose_seq.shape[0] >= n_frames and
+            (pose_seq.shape[0] % frames_per_clip) == 0)
+
+    return pose_seq, clips
 
 
 def get_active_person(people, center=(960, 540), min_bbox_area=20000):
