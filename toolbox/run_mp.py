@@ -30,8 +30,6 @@ import os
 # logging.getLogger('mediapipe').setLevel(logging.ERROR)
 # logging.getLogger('tensorflow').setLevel(logging.ERROR)
 # logging.getLogger('absl').setLevel(logging.ERROR)
-import logging
-logging.basicConfig(filename='train.log', level=logging.INFO)
 
 import json
 import argparse
@@ -105,7 +103,6 @@ def _get_hand_pose(img: np.ndarray, pose: np.ndarray, prev_hands) -> Tuple[Any, 
     # cv2.imshow("org", img)
     # cv2.imshow("cropped_img", cropped_img)
     # cv2.waitKey(1)
-
     return left_hand.copy(), right_hand.copy()
 
 
@@ -135,7 +132,6 @@ def extract_hand_pose(video_full_path: str, pose_json_path: str, frames_per_clip
         pose_json_path: str | path to dir containing pose annotations
         frames_per_clip: int | number of frames each clip contains
     """
-    logging.info(f"{video_full_path}")
     pose_seq = []
     clips = []
     previous_body_pose = np.full((18, 3), 0)  # Store body skeleton pose from previous frame
@@ -185,7 +181,6 @@ def extract_hand_pose(video_full_path: str, pose_json_path: str, frames_per_clip
     # Check same number of pose sequences and check images divisibility of the sequence of poses
     assert (pose_seq.shape[0] == clips.shape[0] and pose_seq.shape[0] >= n_frames and
             (pose_seq.shape[0] % frames_per_clip) == 0)
-
     return pose_seq, clips
 
 
